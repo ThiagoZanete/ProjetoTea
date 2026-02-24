@@ -3,70 +3,73 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 import matplotlib.pyplot as plt
+from sklearn.metrics import roc_auc_score 
 
-
-# Extrai as labels da lista train_subj gerada no Codigo 2
-labels_train = [s['label'] for s in train_subj]
-
-#ARQUITETURA FCN SIMPLIFICADA ---
-class FCN_Apresentacao(nn.Module):
+# arquitetura fcn 1d para os vetores
+class FCN_Apresentacao1D(nn.Module):
     def __init__(self):
-        super(FCN_Apresentacao, self).__init__()
+        super(FCN_Apresentacao1D, self).__init__()
         
-        self.features = nn.Sequential(#Camadas convolucionais para extrair características das matrizes de conectividade. O uso de BatchNorm e Dropout ajuda a estabilizar o treinamento e reduzir o overfitting.
-            nn.Conv2d(1, 16, kernel_size=3, padding=1),
-            nn.BatchNorm2d(16),
+       
+        self.features = nn.Sequential(
+            nn.Conv1d(1, 16, kernel_size=3, padding=1),
+            nn.BatchNorm1d(16),
             nn.LeakyReLU(0.1),
-            nn.MaxPool2d(2),
-            nn.Dropout2d(0.2),
+            nn.MaxPool1d(2),
+            nn.Dropout1d(0.2),
             
-            nn.Conv2d(16, 32, kernel_size=3, padding=1),
-            nn.BatchNorm2d(32),
+            nn.Conv1d(16, 32, kernel_size=3, padding=1),
+            nn.BatchNorm1d(32),
             nn.LeakyReLU(0.1),
-            nn.MaxPool2d(2),
-            nn.Dropout2d(0.2),
+            nn.MaxPool1d(2),
+            nn.Dropout1d(0.2),
             
-            nn.Conv2d(32, 64, kernel_size=3, padding=1),
-            nn.BatchNorm2d(64),
+            nn.Conv1d(32, 64, kernel_size=3, padding=1),
+            nn.BatchNorm1d(64),
             nn.LeakyReLU(0.1),
-            nn.AdaptiveAvgPool2d((1, 1))
+            nn.AdaptiveAvgPool1d(1)
         )
         
-        # Camada final de classificação (1x1 conv para manter a estrutura de FCN, seguida de flatten)
-        self.classifier = nn.Conv2d(64, 2, kernel_size=1)
+        # Camada final de classificacao
+        self.classifier = nn.Conv1d(64, 2, kernel_size=1)
 
     def forward(self, x):
+        # Garante que a entrada tenha a dimensao de canal (Batch, Canal=1, Features=256)
+        if x.dim() == 2:
+            x = x.unsqueeze(1) 
+            
         x = self.features(x)
         x = self.classifier(x)
         return x.view(x.size(0), -1)
 
-
-
-
+# caminhos
 DIRETORIO_SALVAMENTO = '/content/drive/Shareddrives/Projeto_TEA/Dados_TEA_V2/resultados'
 os.makedirs(DIRETORIO_SALVAMENTO, exist_ok=True)
-caminho_modelo_final = os.path.join(DIRETORIO_SALVAMENTO, 'melhor_modelo_fcn.pth')
+caminho_modelo_final = os.path.join(DIRETORIO_SALVAMENTO, 'melhor_modelo1d.pth')
 
-# --- 4. CONFIGURACAO ---
-model = FCN_Apresentacao().to(DEVICE)
-optimizer = optim.Adam(model.parameters(), lr=1e-4, weight_decay=1e-3)#Essa parte é crucial para evitar overfitting, especialmente com um dataset pequeno. O weight_decay penaliza pesos muito grandes, o que ajuda a generalizar melhor. O learning rate de 1e-4 é um bom ponto de partida para uma FCN, mas pode ser ajustado conforme necessário.    
+# config modelo, otimizador, scheduler e criterio de perda
+model = FCN_Apresentacao1D().to(DEVICE)
+optimizer = optim.Adam(model.parameters(), lr=1e-4, weight_decay=1e-3)
 scheduler = optim.lr_scheduler.CosineAnnealingWarmRestarts(optimizer, T_0=10, T_mult=2)
 
-# Pesos para balancear as classes
-count_0 = labels_train.count(0)
-count_1 = labels_train.count(1)
+# Calcula os pesos para a perda com base na distribuicao das classes no treino
+count_0 = (tensor_y_train == 0).sum().item()
+count_1 = (tensor_y_train == 1).sum().item()
 print(f"\nDistribuicao no Treino -> TC (0): {count_0} | TEA (1): {count_1}")
+
 pesos = torch.tensor([1.0 / count_0, 1.0 / count_1], dtype=torch.float).to(DEVICE)
 pesos = pesos / pesos.sum()
-criterion = nn.CrossEntropyLoss(weight=pesos)#
+criterion = nn.CrossEntropyLoss(weight=pesos)
 
-num_epochs = 60
-best_acc = 0.0
-history = {'train_loss': [], 'val_loss': [], 'val_acc': []}
+num_epochs = 100 
+best_auc = 0.0
+early_break = 10
+epochs_sem_melhora = 0
+history = {'train_loss': [], 'val_loss': [], 'val_auc': []}
 
-print("Iniciando treinamento da FCN para Apresentacao...\n")
+print("Iniciando treinamento da FCN 1D (Avaliacao por AUC)...\n")
 
-# --- 5. LOOP DE TREINAMENTO ---
+# loop de treino
 for epoch in range(num_epochs):
     model.train()
     running_loss = 0.0
@@ -82,9 +85,11 @@ for epoch in range(num_epochs):
         
         running_loss += loss.item()
         
-    # Validacao
+    # --- VALIDACAO ---
     model.eval()
-    correct, total, val_loss = 0, 0, 0.0
+    val_loss = 0.0
+    all_true_labels = []
+    all_probs = [] # Para a AUC, precisamos das probabilidades, nao apenas dos chutes
     all_preds = []
     
     with torch.no_grad():
@@ -92,39 +97,51 @@ for epoch in range(num_epochs):
             images, labels = images.to(DEVICE), labels.to(DEVICE)
             outputs = model(images)
             v_loss = criterion(outputs, labels)
-            
             val_loss += v_loss.item()
+            
+            # Aplica Softmax para pegar a probabilidade da Classe 1 (TEA)
+            probs = torch.softmax(outputs, dim=1)[:, 1]
             _, predicted = torch.max(outputs, 1)
-            total += labels.size(0)
-            correct += (predicted == labels).sum().item()
+            
+            all_probs.extend(probs.tolist())
+            all_true_labels.extend(labels.tolist())
             all_preds.extend(predicted.tolist())
             
     avg_train_loss = running_loss / len(train_loader)
     avg_val_loss = val_loss / len(val_loader)
-    acc = 100 * correct / total
     
+    # Calcula a metrica AUC
+    try:
+        auc = roc_auc_score(all_true_labels, all_probs) * 100
+    except ValueError:
+        auc = 0.0 # Previne erro se o batch tiver apenas uma classe
+        
     history['train_loss'].append(avg_train_loss)
     history['val_loss'].append(avg_val_loss)
-    history['val_acc'].append(acc)
+    history['val_auc'].append(auc)
     scheduler.step()
     
-    if acc > best_acc:
-        best_acc = acc
+    # Baseado na AUC, decide se salva o modelo e se ativa o early stopping
+    if auc > best_auc:
+        best_auc = auc
+        epochs_sem_melhora = 0
         torch.save(model.state_dict(), caminho_modelo_final)
-        print(f"Ep {epoch+1:02d}: T-Loss {avg_train_loss:.4f} | V-Loss {avg_val_loss:.4f} | Acc {acc:.1f}% (Salvo!)")
+        print(f"Ep {epoch+1:02d}: T-Loss {avg_train_loss:.4f} | V-Loss {avg_val_loss:.4f} | AUC {auc:.1f}% (Salvo!)")
     else:
-        print(f"Ep {epoch+1:02d}: T-Loss {avg_train_loss:.4f} | V-Loss {avg_val_loss:.4f} | Acc {acc:.1f}%")
+        epochs_sem_melhora += 1
+        print(f"Ep {epoch+1:02d}: T-Loss {avg_train_loss:.4f} | V-Loss {avg_val_loss:.4f} | AUC {auc:.1f}%")
+        
+        if epochs_sem_melhora >= early_break:
+            print(f"\n=> Early Stopping ativado na epoca {epoch+1}! O modelo parou de melhorar a AUC.")
+            break
 
-
-
-
-
-# Diagnóstico final e gráficos
+# --- 5. DIAGNOSTICO FINAL E GRAFICOS ---
 preds_tensor = torch.tensor(all_preds)
 unique_preds, counts = torch.unique(preds_tensor, return_counts=True)
 chutes = dict(zip(unique_preds.tolist(), counts.tolist()))
+
 print(f"\nUltima Epoca - Predicoes na Validacao: {chutes}")
-print(f"Melhor Acuracia: {best_acc:.1f}% (Salvo em {caminho_modelo_final})")
+print(f"Melhor AUC Alcançada: {best_auc:.1f}% (Modelo salvo em {caminho_modelo_final})")
 
 plt.figure(figsize=(12, 4))
 plt.subplot(1, 2, 1)
@@ -134,6 +151,6 @@ plt.title('Curva de Loss')
 plt.legend()
 
 plt.subplot(1, 2, 2)
-plt.plot(history['val_acc'], color='green')
-plt.title('Acuracia de Validacao')
+plt.plot(history['val_auc'], color='purple')
+plt.title('Area Sob a Curva ROC (AUC)')
 plt.show()
