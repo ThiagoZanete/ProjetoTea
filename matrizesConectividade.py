@@ -4,6 +4,7 @@ import shutil
 import pandas as pd
 import numpy as np
 import torch
+import nibabel as nib
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
@@ -30,23 +31,9 @@ print(f"Pipeline FC no {DEVICE}")
 
 
 
-# atlas + masker
+# atlas
 atlas = datasets.fetch_atlas_schaefer_2018(n_rois=100, yeo_networks=7, resolution_mm=2)
-masker = NiftiLabelsMasker(
 
-labels_img=atlas.maps,
-
-standardize= 'zscore_sample',
-
-detrend=True,
-
-low_pass=0.1,
-
-high_pass=0.01,
-
-t_r=2.0
-
-)
 
 corr = ConnectivityMeasure(kind='correlation', standardize= "zscore_sample")
 
@@ -56,17 +43,16 @@ df = pd.read_csv(CSV_PATH)
 print(f"Total de sujeitos no CSV original: {len(df)}")
 
 
-
-
-# Isolando apenas pacientes NYU
-df = df[df['SITE_ID'] == 'NYU']
-print(f"Total de sujeitos da NYU após filtro: {len(df)}")
-
+# df = df[df['SITE_ID'] == 'NYU'] 
 
 df['FILE_ID'] = df['FILE_ID'].astype(str).str.strip().str.replace('no_filename', '')
 
-label_map = {
-    row.FILE_ID: int(row.DX_GROUP == 1)
+
+info_map = {
+    row.FILE_ID: {
+        "label": int(row.DX_GROUP == 1), 
+        "site": str(row.SITE_ID)
+    }
     for _, row in df.iterrows()
     if row.FILE_ID != 'nan'
 }
@@ -78,19 +64,19 @@ for fname in os.listdir(IMGS_DIR):
 
     file_id = fname.replace('_func_preproc.nii.gz', '').replace('_func_preproc.nii', '')
 
-    # ids válidos e presentes no label_map
-    if file_id in label_map:
+    # ids válidos e presentes no info_map
+    if file_id in info_map:
         subjects.append({
             "id": file_id,
             "path": os.path.join(IMGS_DIR, fname),
-            "label": label_map[file_id]
+            "label": info_map[file_id]["label"],
+            "site": info_map[file_id]["site"] 
         })
 
-print(f"Total de imagens da NYU encontradas no Drive: {len(subjects)}")
+print(f"Total de imagens encontradas no Drive: {len(subjects)}")
 
-
-# temanho teste
-NUM_SUJEITOS_TESTE = 180
+# tamanho teste
+NUM_SUJEITOS_TESTE = 400 
 
 if len(subjects) > NUM_SUJEITOS_TESTE:
     print(f"MODO PILOTO: Limitando para os primeiros {NUM_SUJEITOS_TESTE} sujeitos.")
@@ -98,17 +84,25 @@ if len(subjects) > NUM_SUJEITOS_TESTE:
 else:
     subjects_teste = subjects
 
-# split
-train_subj, val_subj = train_test_split(
-    subjects,
-    test_size=0.2,
-    random_state=42,
-    stratify=[s["label"] for s in subjects]
-)
-
-print(f"Split NYU: {len(train_subj)} Treino | {len(val_subj)} Validação")
-
-
+# SPLIT COM TRATAMENTO DE ERRO
+# Como temos muitos centros, algum deles pode ter apenas 1 paciente de uma classe,
+try:
+    train_subj, val_subj = train_test_split(
+        subjects_teste,
+        test_size=0.2,
+        random_state=42,
+        stratify=[f"{s['site']}_{s['label']}" for s in subjects_teste]
+    )
+    print(f"Split Multi-Site: {len(train_subj)} Treino | {len(val_subj)} Validação (Estratificado por Site e Diagnóstico)")
+except ValueError:
+    print("Aviso: Algum centro médico tem amostras insuficientes para estratificação conjunta. Estratificando apenas por Diagnóstico.")
+    train_subj, val_subj = train_test_split(
+        subjects_teste,
+        test_size=0.2,
+        random_state=42,
+        stratify=[s["label"] for s in subjects_teste]
+    )
+    print(f"Split Multi-Site: {len(train_subj)} Treino | {len(val_subj)} Validação (Estratificado apenas por Diagnóstico)")
 
 
 class ABIDEFCDataset(Dataset):
@@ -149,8 +143,28 @@ class ABIDEFCDataset(Dataset):
                 caminho_local_temp = f"/content/temp_{sid}.nii.gz"
                 shutil.copyfile(subj["path"], caminho_local_temp)
 
-                # Extrai Sinais usando o arquivo local
-                ts = masker.fit_transform(caminho_local_temp)
+                # Lendo o tr direto do cabeçalho da imagem ---
+                img = nib.load(caminho_local_temp)
+                # Em imagens fMRI (4D), o 4º elemento do zoom (índice 3) é o Tempo de Repetição
+                tr_img = img.header.get_zooms()[3] 
+                
+                # Tratamento de segurança pq alguns centros salvam o TR em milissegundos 
+                if tr_img > 20: 
+                    tr_img = tr_img / 1000.0
+                
+                # Instancia o masker dinamicamente com o TR correto deste paciente específico
+                masker_dinamico = NiftiLabelsMasker(
+                    labels_img=atlas.maps,
+                    standardize='zscore_sample',
+                    detrend=True,
+                    low_pass=0.1,
+                    high_pass=0.01,
+                    t_r=float(tr_img)
+                )
+
+                # Extrai Sinais usando o arquivo local e o masker dinâmico
+                ts = masker_dinamico.fit_transform(caminho_local_temp)
+            
 
                 # Apaga a imagem temporária para não lotar o disco do Colab
                 os.remove(caminho_local_temp)
@@ -158,7 +172,7 @@ class ABIDEFCDataset(Dataset):
                 # Gera Matriz de Correlação
                 mat = corr.fit_transform([ts])[0]
 
-                #EXTRAÇÃO APENAS DO TRIÂNGULO SUPERIOR
+                # EXTRAÇÃO APENAS DO TRIÂNGULO SUPERIOR
                 triu_idx = np.triu_indices(100, k=1)
                 conn_vector = mat[triu_idx]
 
@@ -238,8 +252,7 @@ X_val = (X_val - mean) / std
 np.save(os.path.join(BASE_DIR, "norm_mean.npy"), mean)
 np.save(os.path.join(BASE_DIR, "norm_std.npy"), std)
 
-# criando os dataloaders
-# Convertemos de volta para Tensores do PyTorch
+#tensores e dataloader
 tensor_X_train = torch.tensor(X_train, dtype=torch.float32)
 tensor_y_train = torch.tensor(y_train, dtype=torch.long)
 tensor_X_val = torch.tensor(X_val, dtype=torch.float32)
