@@ -10,6 +10,7 @@ import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
 from sklearn.model_selection import train_test_split
 from tqdm.auto import tqdm
+from neuroCombat import neuroCombat
 
 from sklearn.feature_selection import SelectKBest, f_classif
 from torch.utils.data import TensorDataset
@@ -18,7 +19,7 @@ from nilearn import datasets
 from nilearn.maskers import NiftiLabelsMasker
 from nilearn.connectome import ConnectivityMeasure
 
-# caminhos 
+# caminhos
 BASE_DIR = '/content/drive/Shareddrives/Projeto_TEA/Dados_TEA_V2/ABIDE_pcp'
 CSV_PATH = f'{BASE_DIR}/Phenotypic_V1_0b_preprocessed1.csv'
 IMGS_DIR = f'{BASE_DIR}/cpac/filt_noglobal'
@@ -43,14 +44,14 @@ df = pd.read_csv(CSV_PATH)
 print(f"Total de sujeitos no CSV original: {len(df)}")
 
 
-# df = df[df['SITE_ID'] == 'NYU'] 
+# df = df[df['SITE_ID'] == 'NYU']
 
 df['FILE_ID'] = df['FILE_ID'].astype(str).str.strip().str.replace('no_filename', '')
 
 
 info_map = {
     row.FILE_ID: {
-        "label": int(row.DX_GROUP == 1), 
+        "label": int(row.DX_GROUP == 1),
         "site": str(row.SITE_ID)
     }
     for _, row in df.iterrows()
@@ -70,13 +71,30 @@ for fname in os.listdir(IMGS_DIR):
             "id": file_id,
             "path": os.path.join(IMGS_DIR, fname),
             "label": info_map[file_id]["label"],
-            "site": info_map[file_id]["site"] 
+            "site": info_map[file_id]["site"]
         })
 
 print(f"Total de imagens encontradas no Drive: {len(subjects)}")
+from collections import Counter
 
-# tamanho teste
-NUM_SUJEITOS_TESTE = 400 
+# Conta quantos pacientes cada hospital tem
+contagem_sites = Counter([s["site"] for s in subjects])
+
+# Define um limite mínimo (5 pacientes é um bom padrão para o ComBat)
+MIN_PACIENTES_POR_SITE = 5
+
+# Lista os sites que serão removidos apenas para você saber quais são
+sites_removidos = [site for site, count in contagem_sites.items() if count < MIN_PACIENTES_POR_SITE]
+if sites_removidos:
+    print(f"Removendo sites com menos de {MIN_PACIENTES_POR_SITE} pacientes: {sites_removidos}")
+
+# Filtra a lista mantendo apenas os hospitais com tamanho suficiente
+subjects = [s for s in subjects if contagem_sites[s["site"]] >= MIN_PACIENTES_POR_SITE]
+
+print(f"Total de imagens válidas após filtro: {len(subjects)}")
+# ==========================================
+
+NUM_SUJEITOS_TESTE = 700
 
 if len(subjects) > NUM_SUJEITOS_TESTE:
     print(f"MODO PILOTO: Limitando para os primeiros {NUM_SUJEITOS_TESTE} sujeitos.")
@@ -146,12 +164,12 @@ class ABIDEFCDataset(Dataset):
                 # Lendo o tr direto do cabeçalho da imagem ---
                 img = nib.load(caminho_local_temp)
                 # Em imagens fMRI (4D), o 4º elemento do zoom (índice 3) é o Tempo de Repetição
-                tr_img = img.header.get_zooms()[3] 
-                
-                # Tratamento de segurança pq alguns centros salvam o TR em milissegundos 
-                if tr_img > 20: 
+                tr_img = img.header.get_zooms()[3]
+
+                # Tratamento de segurança pq alguns centros salvam o TR em milissegundos
+                if tr_img > 20:
                     tr_img = tr_img / 1000.0
-                
+
                 # Instancia o masker dinamicamente com o TR correto deste paciente específico
                 masker_dinamico = NiftiLabelsMasker(
                     labels_img=atlas.maps,
@@ -164,7 +182,7 @@ class ABIDEFCDataset(Dataset):
 
                 # Extrai Sinais usando o arquivo local e o masker dinâmico
                 ts = masker_dinamico.fit_transform(caminho_local_temp)
-            
+
 
                 # Apaga a imagem temporária para não lotar o disco do Colab
                 os.remove(caminho_local_temp)
@@ -215,29 +233,66 @@ class ABIDEFCDataset(Dataset):
         return torch.load(os.path.join(self.cache_dir, f"{sid}.pt"), weights_only=False)
 
 
-# passa da cache para emoria
-def load_all_from_cache(dataset):
-    X, y = [], []
+def load_all_from_cache(dataset, subject_list):
+    X, y, sites = [], [], []
     for i in range(len(dataset)):
         tensor, label = dataset[i]
         X.append(tensor.numpy())
         y.append(label)
-    return np.array(X), np.array(y)
+        # Puxa o 'site' da lista original na mesma ordem
+        sites.append(subject_list[i]["site"])
+    return np.array(X), np.array(y), np.array(sites)
 
-print("\nCarregando dados para aplicar Seleção de Features...")
+
+# 1. PRIMEIRO você cria os datasets
+print("\nVerificando Cache e Gerando Datasets...")
 train_dataset = ABIDEFCDataset(train_subj, cache_dir=CACHE_DIR, drive_dir=DRIVE_CACHE)
 val_dataset = ABIDEFCDataset(val_subj, cache_dir=CACHE_DIR, drive_dir=DRIVE_CACHE)
 
-X_train, y_train = load_all_from_cache(train_dataset)
-X_val, y_val = load_all_from_cache(val_dataset)
+# 2. DEPOIS você extrai os dados usando a função nova
+print("\nCarregando dados da cache e extraindo sites...")
+X_train, y_train, sites_train = load_all_from_cache(train_dataset, train_subj)
+X_val, y_val, sites_val = load_all_from_cache(val_dataset, val_subj)
+
+
+print("\nIniciando Harmonização com ComBat...")
+
+# 1. Juntar os dados temporariamente para o ComBat ter a visão global dos hospitais
+X_all = np.vstack((X_train, X_val))
+y_all = np.concatenate((y_train, y_val))
+sites_all = np.concatenate((sites_train, sites_val))
+
+# 2. O ComBat exige que a matriz seja transposta: (n_features, n_samples)
+data_combat = X_all.T
+
+# 3. Criar o DataFrame de covariáveis (batch = site, categorical = label biológico)
+covars = pd.DataFrame({'batch': sites_all, 'label': y_all})
+
+# 4. Aplicar o algoritmo ComBat
+combat_out = neuroCombat(
+    dat=data_combat,
+    covars=covars,
+    batch_col='batch',
+    categorical_cols=['label']
+)
+data_harmonized = combat_out['data']
+
+# 5. Voltar para o formato do PyTorch (n_samples, n_features)
+X_all_harmonized = data_harmonized.T
+
+# 6. Separar novamente em Treino e Validação respeitando o split original
+X_train = X_all_harmonized[:len(X_train)]
+X_val = X_all_harmonized[len(X_train):]
+
+print("Harmonização concluída! Seguindo para Seleção de Features...")
 
 # Select Kbest
 print("Aplicando SelectKBest (reduzindo para as 256 melhores conexões)...")
-selector = SelectKBest(f_classif, k=256)
+selector = SelectKBest(f_classif, k=64)
 X_train = selector.fit_transform(X_train, y_train)
 X_val = selector.transform(X_val)
 
-# Salvar índices para o futuro 
+# Salvar índices para o futuro
 selected_indices = selector.get_support(indices=True)
 np.save(os.path.join(BASE_DIR, "indices_selecionados.npy"), selected_indices)
 
