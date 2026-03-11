@@ -14,6 +14,7 @@ from neuroCombat import neuroCombat
 
 from sklearn.feature_selection import SelectKBest, f_classif
 from torch.utils.data import TensorDataset
+from sklearn.feature_selection import mutual_info_classif
 
 from nilearn import datasets
 from nilearn.maskers import NiftiLabelsMasker
@@ -30,12 +31,27 @@ BATCH_SIZE = 16
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(f"Pipeline FC no {DEVICE}")
 
-
+#funcao para calcular a conectividade em nível de rede isso vai ser usado para gerar features adicionais de conectividade em nível de rede, que podem complementar as conexões individuais entre regiões. A ideia é agrupar as regiões do atlas em redes (com base nos rótulos do atlas) e calcular a média dos sinais temporais dentro de cada rede. Em seguida, calculamos a matriz de correlação entre essas redes e extraímos os valores do triângulo superior para usar como features adicionais.
+def compute_network_fc(ts, atlas_labels):
+    networks = {}
+    for i, label in enumerate(atlas_labels):
+        net = label.decode() if isinstance(label, bytes) else label
+        net = net.split('_')[0]
+        if net not in networks:
+            networks[net] = []
+        networks[net].append(i)
+    network_ts = []
+    for net in networks:
+        idx = networks[net]
+        network_ts.append(ts[:, idx].mean(axis=1))
+    network_ts = np.array(network_ts).T
+    net_corr = np.corrcoef(network_ts.T)
+    triu_idx = np.triu_indices(len(networks), k=1)
+    return net_corr[triu_idx]
 
 # atlas
 atlas = datasets.fetch_atlas_schaefer_2018(n_rois=100, yeo_networks=7, resolution_mm=2)
-
-
+atlas_labels = atlas.labels
 corr = ConnectivityMeasure(kind='correlation', standardize= "zscore_sample")
 
 #
@@ -43,11 +59,9 @@ corr = ConnectivityMeasure(kind='correlation', standardize= "zscore_sample")
 df = pd.read_csv(CSV_PATH)
 print(f"Total de sujeitos no CSV original: {len(df)}")
 
-
 # df = df[df['SITE_ID'] == 'NYU']
 
 df['FILE_ID'] = df['FILE_ID'].astype(str).str.strip().str.replace('no_filename', '')
-
 
 info_map = {
     row.FILE_ID: {
@@ -62,7 +76,6 @@ info_map = {
 subjects = []
 for fname in os.listdir(IMGS_DIR):
     if not fname.endswith(('.nii', '.nii.gz')): continue
-
     file_id = fname.replace('_func_preproc.nii.gz', '').replace('_func_preproc.nii', '')
 
     # ids válidos e presentes no info_map
@@ -73,13 +86,11 @@ for fname in os.listdir(IMGS_DIR):
             "label": info_map[file_id]["label"],
             "site": info_map[file_id]["site"]
         })
-
 print(f"Total de imagens encontradas no Drive: {len(subjects)}")
 from collections import Counter
 
 # Conta quantos pacientes cada hospital tem
 contagem_sites = Counter([s["site"] for s in subjects])
-
 # Define um limite mínimo (5 pacientes é um bom padrão para o ComBat)
 MIN_PACIENTES_POR_SITE = 5
 
@@ -90,9 +101,8 @@ if sites_removidos:
 
 # Filtra a lista mantendo apenas os hospitais com tamanho suficiente
 subjects = [s for s in subjects if contagem_sites[s["site"]] >= MIN_PACIENTES_POR_SITE]
-
 print(f"Total de imagens válidas após filtro: {len(subjects)}")
-# ==========================================
+
 
 NUM_SUJEITOS_TESTE = 700
 
@@ -160,16 +170,13 @@ class ABIDEFCDataset(Dataset):
                 # Copia a imagem do Drive para a máquina local do Colab
                 caminho_local_temp = f"/content/temp_{sid}.nii.gz"
                 shutil.copyfile(subj["path"], caminho_local_temp)
-
                 # Lendo o tr direto do cabeçalho da imagem ---
                 img = nib.load(caminho_local_temp)
                 # Em imagens fMRI (4D), o 4º elemento do zoom (índice 3) é o Tempo de Repetição
                 tr_img = img.header.get_zooms()[3]
-
                 # Tratamento de segurança pq alguns centros salvam o TR em milissegundos
                 if tr_img > 20:
                     tr_img = tr_img / 1000.0
-
                 # Instancia o masker dinamicamente com o TR correto deste paciente específico
                 masker_dinamico = NiftiLabelsMasker(
                     labels_img=atlas.maps,
@@ -182,27 +189,24 @@ class ABIDEFCDataset(Dataset):
 
                 # Extrai Sinais usando o arquivo local e o masker dinâmico
                 ts = masker_dinamico.fit_transform(caminho_local_temp)
-
-
+                # network-level connectivity
+                net_vec = compute_network_fc(ts, atlas_labels)
+                net_vec = np.arctanh(np.clip(net_vec, -0.99, 0.99))
                 # Apaga a imagem temporária para não lotar o disco do Colab
                 os.remove(caminho_local_temp)
-
                 # Gera Matriz de Correlação
                 mat = corr.fit_transform([ts])[0]
-
                 # EXTRAÇÃO APENAS DO TRIÂNGULO SUPERIOR
                 triu_idx = np.triu_indices(100, k=1)
                 conn_vector = mat[triu_idx]
-
                 # fisher z-transform para estabilizar a variância das correlações no vetor
                 conn_vector = np.arctanh(np.clip(conn_vector, -0.99, 0.99))
-
+                # juntar features
+                conn_vector = np.concatenate([conn_vector, net_vec])
                 # Converte para Tensor
                 tensor = torch.from_numpy(conn_vector).float()
-
                 # Salva localmente
                 torch.save((tensor, subj["label"]), cache_file)
-
                 # Sincroniza salvando uma cópia no Drive para o futuro
                 if self.drive_dir:
                     self._sync(cache_file)
@@ -212,10 +216,6 @@ class ABIDEFCDataset(Dataset):
                 # Se der erro no meio, garante que o arquivo temporário será apagado
                 if os.path.exists(f"/content/temp_{sid}.nii.gz"):
                     os.remove(f"/content/temp_{sid}.nii.gz")
-
-
-
-
 
 
 
@@ -244,60 +244,95 @@ def load_all_from_cache(dataset, subject_list):
     return np.array(X), np.array(y), np.array(sites)
 
 
+
+
+def sparsify_fc(X, percent=0.2):
+    X_sparse = X.copy()
+    for i in range(X.shape[0]):
+        threshold = np.percentile(np.abs(X[i]), 100*(1-percent))
+        mask = np.abs(X[i]) < threshold
+        X_sparse[i][mask] = 0
+
+    return X_sparse
+
 # 1. PRIMEIRO você cria os datasets
 print("\nVerificando Cache e Gerando Datasets...")
 train_dataset = ABIDEFCDataset(train_subj, cache_dir=CACHE_DIR, drive_dir=DRIVE_CACHE)
 val_dataset = ABIDEFCDataset(val_subj, cache_dir=CACHE_DIR, drive_dir=DRIVE_CACHE)
-
 # 2. DEPOIS você extrai os dados usando a função nova
 print("\nCarregando dados da cache e extraindo sites...")
 X_train, y_train, sites_train = load_all_from_cache(train_dataset, train_subj)
 X_val, y_val, sites_val = load_all_from_cache(val_dataset, val_subj)
 
 
+
 print("\nIniciando Harmonização com ComBat...")
-
-# 1. Juntar os dados temporariamente para o ComBat ter a visão global dos hospitais
-X_all = np.vstack((X_train, X_val))
-y_all = np.concatenate((y_train, y_val))
-sites_all = np.concatenate((sites_train, sites_val))
-
-# 2. O ComBat exige que a matriz seja transposta: (n_features, n_samples)
-data_combat = X_all.T
-
-# 3. Criar o DataFrame de covariáveis (batch = site, categorical = label biológico)
-covars = pd.DataFrame({'batch': sites_all, 'label': y_all})
-
-# 4. Aplicar o algoritmo ComBat
-combat_out = neuroCombat(
-    dat=data_combat,
-    covars=covars,
+# COMBAT APENAS NO TREINO
+data_train_combat = X_train.T
+covars_train = pd.DataFrame({
+    'batch': sites_train,
+    'label': y_train
+})
+combat_train = neuroCombat(
+    dat=data_train_combat,
+    covars=covars_train,
     batch_col='batch',
     categorical_cols=['label']
 )
-data_harmonized = combat_out['data']
+X_train_harmonized = combat_train['data'].T
 
-# 5. Voltar para o formato do PyTorch (n_samples, n_features)
-X_all_harmonized = data_harmonized.T
+# Para o validation usamos apenas centralização por site baseada no treino
+X_val_harmonized = X_val.copy()
+site_means = {}
+for site in np.unique(sites_train):
+    site_means[site] = X_train[sites_train == site].mean(axis=0)
+global_mean = X_train.mean(axis=0)
 
-# 6. Separar novamente em Treino e Validação respeitando o split original
-X_train = X_all_harmonized[:len(X_train)]
-X_val = X_all_harmonized[len(X_train):]
-
+for i, site in enumerate(sites_val):
+    if site in site_means:
+        X_val_harmonized[i] = X_val[i] - site_means[site] + global_mean
+X_train = X_train_harmonized
+X_val = X_val_harmonized
 print("Harmonização concluída! Seguindo para Seleção de Features...")
 
-# Select Kbest
-print("Aplicando SelectKBest (reduzindo para as 256 melhores conexões)...")
-selector = SelectKBest(f_classif, k=64)
+
+
+
+def edge_filter(X_train, y_train, X_val, keep_ratio=0.2):
+    from scipy.stats import ttest_ind
+    group0 = X_train[y_train == 0]
+    group1 = X_train[y_train == 1]
+    t_vals, _ = ttest_ind(group0, group1, axis=0, equal_var=False)
+    t_vals = np.nan_to_num(np.abs(t_vals))
+    k = int(len(t_vals) * keep_ratio)
+    top_idx = np.argsort(t_vals)[-k:]
+    X_train_filtered = X_train[:, top_idx]
+    X_val_filtered = X_val[:, top_idx]
+    return X_train_filtered, X_val_filtered, top_idx
+
+#vou colocar isso depois se precisar
+#print("Aplicando Edge Filtering (top 20% conexões discriminativas)...")
+#X_train, X_val, edge_idx = edge_filter(X_train, y_train, X_val, keep_ratio=0.2)
+#np.save(os.path.join(BASE_DIR, "edges_filtradas.npy"), edge_idx)
+
+
+
+
+
+# FEATURE SELECTION
+print("Aplicando SelectKBest (256 conexões)...")
+selector = SelectKBest(mutual_info_classif, k=256)
 X_train = selector.fit_transform(X_train, y_train)
 X_val = selector.transform(X_val)
 
-# Salvar índices para o futuro
 selected_indices = selector.get_support(indices=True)
 np.save(os.path.join(BASE_DIR, "indices_selecionados.npy"), selected_indices)
 
-#normalização
+
+
+# NORMALIZAÇÃO
 print("Aplicando Normalização...")
+
 mean = X_train.mean(axis=0)
 std = X_train.std(axis=0) + 1e-6
 
