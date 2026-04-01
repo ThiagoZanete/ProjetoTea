@@ -8,34 +8,36 @@ from sklearn.metrics import roc_auc_score
 # MODELO
 class FCN_Apresentacao1D(nn.Module):
 
-    def __init__(self, input_size=256):
+    def __init__(self, input_size=512):
         super().__init__()
 
         self.features = nn.Sequential(
 
-            nn.Conv1d(1, 16, kernel_size=3, padding=1),
-            nn.BatchNorm1d(16),
-            nn.LeakyReLU(0.1),
+            #reduzidos para 8, ReLU e Dropout 0.1
+            nn.Conv1d(1, 8, kernel_size=3, padding=1),
+            nn.BatchNorm1d(8),
+            nn.ReLU(),
             nn.MaxPool1d(2),
-            nn.Dropout1d(0.25),
+            nn.Dropout1d(0.1),
 
+            #reduzidos para 16, ReLU e Dropout 0.1
+            nn.Conv1d(8, 16, kernel_size=3, padding=1),
+            nn.BatchNorm1d(16),
+            nn.ReLU(),
+            nn.MaxPool1d(2),
+            nn.Dropout1d(0.1),
+
+            #reduzidos para 32, ReLU
             nn.Conv1d(16, 32, kernel_size=3, padding=1),
             nn.BatchNorm1d(32),
-            nn.LeakyReLU(0.1),
-            nn.MaxPool1d(2),
-            nn.Dropout1d(0.25),
-
-            nn.Conv1d(32, 64, kernel_size=3, padding=1),
-            nn.BatchNorm1d(64),
-            nn.LeakyReLU(0.1),
-
+            nn.ReLU(),
             nn.AdaptiveAvgPool1d(1)
         )
 
-        self.classifier = nn.Conv1d(64, 2, kernel_size=1)
+        # receber o tamanho de saída do último filtro (32)
+        self.classifier = nn.Conv1d(32, 2, kernel_size=1)
 
     def forward(self, x):
-
         if x.dim() == 2:
             x = x.unsqueeze(1)
 
@@ -43,7 +45,6 @@ class FCN_Apresentacao1D(nn.Module):
         x = self.classifier(x)
 
         return x.view(x.size(0), -1)
-
 
 
 # SALVAMENTO

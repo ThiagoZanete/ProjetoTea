@@ -25,8 +25,8 @@ BASE_DIR = '/content/drive/Shareddrives/Projeto_TEA/Dados_TEA_V2/ABIDE_pcp'
 CSV_PATH = f'{BASE_DIR}/Phenotypic_V1_0b_preprocessed1.csv'
 IMGS_DIR = f'{BASE_DIR}/cpac/filt_noglobal'
 #cache
-CACHE_DIR = '/content/fc_cache_1d'
-DRIVE_CACHE = f'{BASE_DIR}/fc_cache_1d'
+CACHE_DIR = '/content/fc_cache_1d_V2'
+DRIVE_CACHE = f'{BASE_DIR}/fc_cache_1d_V2'
 BATCH_SIZE = 16
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(f"Pipeline FC no {DEVICE}")
@@ -35,23 +35,35 @@ print(f"Pipeline FC no {DEVICE}")
 def compute_network_fc(ts, atlas_labels):
     networks = {}
     for i, label in enumerate(atlas_labels):
-        net = label.decode() if isinstance(label, bytes) else label
-        net = net.split('_')[0]
+        name = label.decode() if isinstance(label, bytes) else str(label)
+        # CORREÇÃO AQUI: Índice [2] para pegar a rede real (ex: Vis, SomMot, Default)
+        net = name.split('_')[2] 
         if net not in networks:
             networks[net] = []
         networks[net].append(i)
+        
     network_ts = []
     for net in networks:
         idx = networks[net]
         network_ts.append(ts[:, idx].mean(axis=1))
+        
     network_ts = np.array(network_ts).T
     net_corr = np.corrcoef(network_ts.T)
     triu_idx = np.triu_indices(len(networks), k=1)
     return net_corr[triu_idx]
-
-# atlas
 atlas = datasets.fetch_atlas_schaefer_2018(n_rois=100, yeo_networks=7, resolution_mm=2)
-atlas_labels = atlas.labels
+
+
+
+# CORREÇÃO DO ERRO INDEX 100: Limpando o Background
+atlas_labels = []
+for label in atlas.labels:
+    name = label.decode() if isinstance(label, bytes) else str(label)
+    if name != 'Background':
+        atlas_labels.append(name)
+
+
+
 corr = ConnectivityMeasure(kind='correlation', standardize= "zscore_sample")
 
 #
@@ -112,6 +124,10 @@ if len(subjects) > NUM_SUJEITOS_TESTE:
 else:
     subjects_teste = subjects
 
+
+
+
+
 # SPLIT COM TRATAMENTO DE ERRO
 # Como temos muitos centros, algum deles pode ter apenas 1 paciente de uma classe,
 try:
@@ -131,6 +147,11 @@ except ValueError:
         stratify=[s["label"] for s in subjects_teste]
     )
     print(f"Split Multi-Site: {len(train_subj)} Treino | {len(val_subj)} Validação (Estratificado apenas por Diagnóstico)")
+
+
+
+
+
 
 
 class ABIDEFCDataset(Dataset):
@@ -170,7 +191,7 @@ class ABIDEFCDataset(Dataset):
                 # Copia a imagem do Drive para a máquina local do Colab
                 caminho_local_temp = f"/content/temp_{sid}.nii.gz"
                 shutil.copyfile(subj["path"], caminho_local_temp)
-                # Lendo o tr direto do cabeçalho da imagem ---
+                # Lendo o tr direto do cabeçalho da imagem 
                 img = nib.load(caminho_local_temp)
                 # Em imagens fMRI (4D), o 4º elemento do zoom (índice 3) é o Tempo de Repetição
                 tr_img = img.header.get_zooms()[3]
@@ -187,6 +208,7 @@ class ABIDEFCDataset(Dataset):
                     t_r=float(tr_img)
                 )
 
+
                 # Extrai Sinais usando o arquivo local e o masker dinâmico
                 ts = masker_dinamico.fit_transform(caminho_local_temp)
                 # network-level connectivity
@@ -194,12 +216,33 @@ class ABIDEFCDataset(Dataset):
                 net_vec = np.arctanh(np.clip(net_vec, -0.99, 0.99))
                 # Apaga a imagem temporária para não lotar o disco do Colab
                 os.remove(caminho_local_temp)
+        
                 # Gera Matriz de Correlação
                 mat = corr.fit_transform([ts])[0]
+                
                 # EXTRAÇÃO APENAS DO TRIÂNGULO SUPERIOR
                 triu_idx = np.triu_indices(100, k=1)
                 conn_vector = mat[triu_idx]
-                # fisher z-transform para estabilizar a variância das correlações no vetor
+
+                # Ordenar edges por rede conforme pedido Siac.
+                roi_network = []
+                for label in atlas_labels:
+                    name = label.decode() if isinstance(label, bytes) else str(label)
+                    # CORREÇÃO AQUI: Mesma lógica do índice [2]
+                    net = name.split('_')[2]
+                    roi_network.append(net)
+                
+                edge_labels = []
+                for i, j in zip(triu_idx[0], triu_idx[1]):
+                    net1 = roi_network[i]
+                    net2 = roi_network[j]
+                    edge_labels.append(tuple(sorted([net1, net2])))
+                
+                # CORREÇÃO DA ORDENAÇÃO: Python puro é blindado contra o erro de matriz 2D do numpy
+                edge_order = sorted(range(len(edge_labels)), key=lambda x: edge_labels[x])
+                conn_vector = conn_vector[edge_order]
+
+                # fisher z-transform
                 conn_vector = np.arctanh(np.clip(conn_vector, -0.99, 0.99))
                 # juntar features
                 conn_vector = np.concatenate([conn_vector, net_vec])
@@ -245,7 +288,6 @@ def load_all_from_cache(dataset, subject_list):
 
 
 
-
 def sparsify_fc(X, percent=0.2):
     X_sparse = X.copy()
     for i in range(X.shape[0]):
@@ -255,11 +297,12 @@ def sparsify_fc(X, percent=0.2):
 
     return X_sparse
 
-# 1. PRIMEIRO você cria os datasets
+
+# cria os datasets
 print("\nVerificando Cache e Gerando Datasets...")
 train_dataset = ABIDEFCDataset(train_subj, cache_dir=CACHE_DIR, drive_dir=DRIVE_CACHE)
 val_dataset = ABIDEFCDataset(val_subj, cache_dir=CACHE_DIR, drive_dir=DRIVE_CACHE)
-# 2. DEPOIS você extrai os dados usando a função nova
+# extrai os dados usando a função nova
 print("\nCarregando dados da cache e extraindo sites...")
 X_train, y_train, sites_train = load_all_from_cache(train_dataset, train_subj)
 X_val, y_val, sites_val = load_all_from_cache(val_dataset, val_subj)
@@ -310,7 +353,9 @@ def edge_filter(X_train, y_train, X_val, keep_ratio=0.2):
     X_val_filtered = X_val[:, top_idx]
     return X_train_filtered, X_val_filtered, top_idx
 
-#vou colocar isso depois se precisar
+
+
+#vou colocar isso depois se precisar 
 #print("Aplicando Edge Filtering (top 20% conexões discriminativas)...")
 #X_train, X_val, edge_idx = edge_filter(X_train, y_train, X_val, keep_ratio=0.2)
 #np.save(os.path.join(BASE_DIR, "edges_filtradas.npy"), edge_idx)
@@ -318,16 +363,39 @@ def edge_filter(X_train, y_train, X_val, keep_ratio=0.2):
 
 
 
-
 # FEATURE SELECTION
-print("Aplicando SelectKBest (256 conexões)...")
-selector = SelectKBest(mutual_info_classif, k=256)
+print("Aplicando SelectKBest (512 conexões com mutual_info_classif)...")
+# Sugestão (b) do Sica
+selector = SelectKBest(mutual_info_classif, k=512)
+
+X_train = selector.fit_transform(X_train, y_train)
+X_val = selector.transform(X_val)
+
+selected_indices = selector.get_support(indices=True)
+np.save(os.path.join(BASE_DIR, "indices_selecionados.npy"), selected_indices)
+# Sugestão (c) do Sica: ordenar features por importância
+scores = selector.scores_[selected_indices]
+order = np.argsort(scores)[::-1]
+
+X_train = X_train[:, order]
+X_val = X_val[:, order]
+
+
+
+'''
+#essa parte eu deixei comentada por que a parte logo acima está com as mudanças sugetidas
+# FEATURE SELECTION USANDO F_CLASSIF
+print("Aplicando SelectKBest (512 conexões)...")
+# Usando f_classif (mais rápido e estável para essa quantidade)
+selector = SelectKBest(f_classif, k=512)
+
 X_train = selector.fit_transform(X_train, y_train)
 X_val = selector.transform(X_val)
 
 selected_indices = selector.get_support(indices=True)
 np.save(os.path.join(BASE_DIR, "indices_selecionados.npy"), selected_indices)
 
+'''
 
 
 # NORMALIZAÇÃO
