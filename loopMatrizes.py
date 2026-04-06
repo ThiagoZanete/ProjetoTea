@@ -13,28 +13,23 @@ class FCN_Apresentacao1D(nn.Module):
 
         self.features = nn.Sequential(
 
-            #reduzidos para 8, ReLU e Dropout 0.1
-            nn.Conv1d(1, 8, kernel_size=3, padding=1),
+            nn.Conv1d(1, 8, kernel_size=3, padding=1, stride=2), 
             nn.BatchNorm1d(8),
             nn.ReLU(),
-            nn.MaxPool1d(2),
-            nn.Dropout1d(0.1),
+            nn.Dropout1d(0.2), 
 
-            #reduzidos para 16, ReLU e Dropout 0.1
-            nn.Conv1d(8, 16, kernel_size=3, padding=1),
+            nn.Conv1d(8, 16, kernel_size=3, padding=1, stride=2),
             nn.BatchNorm1d(16),
             nn.ReLU(),
-            nn.MaxPool1d(2),
-            nn.Dropout1d(0.1),
+            nn.Dropout1d(0.3),
 
-            #reduzidos para 32, ReLU
             nn.Conv1d(16, 32, kernel_size=3, padding=1),
             nn.BatchNorm1d(32),
             nn.ReLU(),
+            
             nn.AdaptiveAvgPool1d(1)
         )
 
-        # receber o tamanho de saída do último filtro (32)
         self.classifier = nn.Conv1d(32, 2, kernel_size=1)
 
     def forward(self, x):
@@ -43,8 +38,8 @@ class FCN_Apresentacao1D(nn.Module):
 
         x = self.features(x)
         x = self.classifier(x)
-
         return x.view(x.size(0), -1)
+
 
 
 # SALVAMENTO
@@ -62,13 +57,13 @@ model = FCN_Apresentacao1D().to(DEVICE)
 
 optimizer = optim.Adam(
     model.parameters(),
-    lr=1e-4,
+    lr=1e-3,
     weight_decay=1e-3
 )
 
 scheduler = optim.lr_scheduler.CosineAnnealingWarmRestarts(
     optimizer,
-    T_0=10,
+    T_0=25,
     T_mult=2
 )
 
